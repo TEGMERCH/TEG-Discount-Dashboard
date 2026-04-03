@@ -1,0 +1,810 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>TEG Discount Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0A0A0F;color:#E2E2F0;font-family:'DM Mono',monospace;min-height:100vh}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#0D0D14}
+::-webkit-scrollbar-thumb{background:#2a2a3a;border-radius:3px}
+select option{background:#0D0D14;color:#E2E2F0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:28px;height:28px;border:3px solid #2a2a3a;border-top-color:#E8294A;border-radius:50%;animation:spin 0.7s linear infinite;margin:0 auto 10px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useMemo,useRef,useEffect} = React;
+
+const BG="#0A0A0F",CARD="#111118",BORDER="#1E1E2E",DARK="#0D0D14",TEXT="#E2E2F0",MUTED="#55556A";
+const TEG="#E8294A",GBGS="#7C3AED",GREEN="#22C55E",GOLD="#F59E0B",BLUE="#3B82F6";
+const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const GAS_KEY="teg_discount_gas_url_v1";
+const PASSWORD="teg2026";
+
+function r2(n){return Math.round((n||0)*100)/100}
+function fmtUSD(n){return"$"+Math.abs(n||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}
+function fmtYM(ym){
+  if(!ym||ym==="Unknown")return"Unknown";
+  const[y,m]=ym.split("-");
+  return MONTHS[parseInt(m,10)-1]+" '"+y.slice(2);
+}
+function parseDate(raw){
+  const s=String(raw||"").replace(/[^0-9]/g,"");
+  if(s.length===8)return s.slice(0,4)+"-"+s.slice(4,6)+"-"+s.slice(6,8);
+  return null;
+}
+function normName(raw){
+  if(!raw)return"";
+  return raw.trim()
+    .replace(/\s+\d+\.\s*(XS|S|M|L|XL|XXL|2XL|3XL|OSFM)\s*$/i,"")
+    .replace(/\s+(XS|S|M|L|XL|XXL|2XL|3XL|OSFM)\s*$/i,"")
+    .trim();
+}
+function normStore(raw){
+  if(!raw)return"";
+  return raw.trim().replace(/\s*\(\d+\)\s*$/,"").replace(/gbgs/gi,"").trim()||raw.trim().replace(/\s*\(\d+\)\s*$/,"");
+}
+
+function parseCSVRows(text){
+  const lines=text.split(/\r?\n/).filter(Boolean);
+  return lines.map(line=>{
+    const cols=[],len=line.length;let cur="",inQ=false;
+    for(let i=0;i<len;i++){
+      const c=line[i];
+      if(c==='"'){inQ=!inQ}
+      else if(c===','&&!inQ){cols.push(cur);cur=""}
+      else cur+=c;
+    }
+    cols.push(cur);
+    return cols;
+  });
+}
+
+function processCSV(text){
+  const rows=parseCSVRows(text);
+  const result=[];
+  for(const r of rows){
+    if(!r[0]||r[0].trim()==="_TEG_TICKER"||r[0].trim()==="TEG_TICKER")continue;
+    let ticker=(r[0]||"").trim();
+    if(ticker.toLowerCase()==="null")ticker="BIR (59)";
+    if(/^am\b|adventure\s*mining/i.test(ticker))continue;
+    const product=normName(r[4]||"");
+    if(/^am\b|adventure\s*mining/i.test(product))continue;
+    const isGBGS=/gbgs/i.test(ticker)||/gbgs/i.test(product);
+    const brand=isGBGS?"gbgs":"teg";
+    const store=isGBGS
+      ? (ticker.replace(/gbgs/gi,"").replace(/\s*\(\d+\)\s*$/,"").trim()||ticker.replace(/\s*\(\d+\)\s*$/,""))
+      : normStore(ticker);
+    const date=parseDate(r[3]);
+    const ym=date?date.slice(0,7):"Unknown";
+    const priceUnit=parseFloat(r[5])||0;
+    const qty=parseInt(r[6])||0;
+    const total=parseFloat(r[7])||0;
+    const discount=parseFloat(r[8])||0;
+    const reasonRaw=(r[9]||"").trim();
+    const reason=(reasonRaw&&reasonRaw!=="null"&&reasonRaw!=="")?reasonRaw:"";
+    const finalAmt=parseFloat(r[10])||0;
+    result.push({date,ym,store,brand,product,priceUnit,qty,total,discount,reason,finalAmt});
+  }
+  return result;
+}
+
+async function gasGet(url,action){
+  const res=await fetch(`${url}?action=${action}`,{method:"GET",mode:"cors"});
+  return res.json();
+}
+async function gasPost(url,action,payload){
+  const fd=new FormData();
+  fd.append("action",action);
+  if(payload)fd.append("payload",encodeURIComponent(JSON.stringify(payload)));
+  await fetch(url,{method:"POST",mode:"no-cors",body:fd});
+  return{ok:true};
+}
+
+// ── KPI ───────────────────────────────────────────────────────────────────────
+function KPI({label,value,sub,accent}){
+  return(
+    <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:"16px 18px",flex:1,minWidth:140}}>
+      <div style={{fontSize:9,color:MUTED,letterSpacing:2,textTransform:"uppercase",marginBottom:6}}>{label}</div>
+      <div style={{fontSize:24,fontFamily:"'Bebas Neue',sans-serif",color:accent,lineHeight:1}}>{value}</div>
+      {sub&&<div style={{fontSize:9,color:MUTED,marginTop:4}}>{sub}</div>}
+    </div>
+  );
+}
+
+// ── Bar chart ─────────────────────────────────────────────────────────────────
+function Bars({data,vKey,lKey,accent,maxBars=12,fmt}){
+  if(!data||!data.length)return<div style={{color:MUTED,fontSize:11,padding:12}}>No data</div>;
+  const items=data.slice(0,maxBars);
+  const max=Math.max(...items.map(d=>d[vKey]||0));
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:5}}>
+      {items.map((d,i)=>{
+        const pct=max>0?(d[vKey]/max)*100:0;
+        return(
+          <div key={i} style={{display:"flex",alignItems:"center",gap:8}}>
+            <div style={{width:120,fontSize:10,color:"#aaa",textAlign:"right",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis",flexShrink:0}}>{d[lKey]}</div>
+            <div style={{flex:1,height:16,background:DARK,borderRadius:3,overflow:"hidden"}}>
+              <div style={{width:`${pct}%`,height:"100%",background:accent,borderRadius:3}}/>
+            </div>
+            <div style={{width:68,fontSize:10,color:TEXT,textAlign:"right",flexShrink:0}}>{fmt?fmt(d[vKey]):d[vKey]}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Dual line chart ────────────────────────────────────────────────────────────
+function DualLine({data,accent}){
+  if(!data||data.length<2)return<div style={{color:MUTED,fontSize:11,padding:12}}>Not enough data</div>;
+  const W=400,H=100,P=8;
+  const allV=[...data.map(d=>d.gross),...data.map(d=>d.actual)];
+  const mn=Math.min(...allV),mx=Math.max(...allV),rng=mx-mn||1;
+  const px=i=>P+(i/(data.length-1))*(W-P*2);
+  const py=v=>H-P-((v-mn)/rng)*(H-P*2);
+  const gPts=data.map((d,i)=>`${px(i)},${py(d.gross)}`).join(" ");
+  const aPts=data.map((d,i)=>`${px(i)},${py(d.actual)}`).join(" ");
+  return(
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H,display:"block"}}>
+        <polyline points={gPts} fill="none" stroke={GREEN} strokeWidth={1.5} strokeDasharray="4,3"/>
+        <polyline points={aPts} fill="none" stroke={accent} strokeWidth={2}/>
+        {data.map((d,i)=><circle key={i} cx={px(i)} cy={py(d.actual)} r={2.5} fill={accent}/>)}
+      </svg>
+      <div style={{display:"flex",justifyContent:"space-between",padding:"0 8px",marginTop:2}}>
+        <span style={{fontSize:9,color:MUTED}}>{fmtYM(data[0]?.ym)}</span>
+        <span style={{fontSize:9,color:MUTED}}>{fmtYM(data[data.length-1]?.ym)}</span>
+      </div>
+      <div style={{display:"flex",gap:14,marginTop:6,paddingLeft:4}}>
+        <div style={{display:"flex",alignItems:"center",gap:5}}><div style={{width:14,borderTop:`2px dashed ${GREEN}`}}/><span style={{fontSize:9,color:GREEN}}>Gross</span></div>
+        <div style={{display:"flex",alignItems:"center",gap:5}}><div style={{width:14,borderTop:`2px solid ${accent}`}}/><span style={{fontSize:9,color:accent}}>Actual</span></div>
+      </div>
+    </div>
+  );
+}
+
+function SecHead({children,accent}){
+  return<div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:17,color:accent,letterSpacing:2,marginBottom:12,borderBottom:`1px solid ${BORDER}`,paddingBottom:5}}>{children}</div>;
+}
+
+
+// ── Trends & Players View ─────────────────────────────────────────────────────
+function TrendsView({rows, brand, accent}){
+  const [players, setPlayers] = useState({});
+  const chartRef1 = useRef(null);
+  const chartRef2 = useRef(null);
+  const chartInst1 = useRef(null);
+  const chartInst2 = useRef(null);
+
+  // Aggregate by month
+  const byMonth = useMemo(()=>{
+    const m={};
+    for(const r of rows){
+      if(!m[r.ym])m[r.ym]={ym:r.ym,gross:0,actual:0,discount:0};
+      m[r.ym].gross+=r.total;
+      m[r.ym].actual+=r.finalAmt;
+      m[r.ym].discount+=r.discount;
+    }
+    return Object.values(m).sort((a,b)=>a.ym>b.ym?1:-1);
+  },[rows]);
+
+  const labels = byMonth.map(d=>fmtYM(d.ym));
+
+  // Per-player data
+  const perPlayer = useMemo(()=>byMonth.map(d=>{
+    const p = parseFloat(players[d.ym])||0;
+    if(!p) return null;
+    return {
+      ym: d.ym,
+      grossPP: r2(d.gross/p),
+      actualPP: r2(d.actual/p),
+      discountPP: r2(d.discount/p),
+    };
+  }),[byMonth, players]);
+
+  const hasPlayerData = perPlayer.some(d=>d!==null);
+
+  function destroyCharts(){
+    if(chartInst1.current){chartInst1.current.destroy();chartInst1.current=null;}
+    if(chartInst2.current){chartInst2.current.destroy();chartInst2.current=null;}
+  }
+
+  useEffect(()=>{
+    if(!byMonth.length||!chartRef1.current||typeof Chart==="undefined") return;
+    destroyCharts();
+
+    // Chart 1 — Revenue lines + discount bars
+    chartInst1.current = new Chart(chartRef1.current, {
+      data:{
+        labels,
+        datasets:[
+          {type:"line",label:"Gross",data:byMonth.map(d=>r2(d.gross)),borderColor:"#22C55E",backgroundColor:"#22C55E22",borderDash:[6,3],borderWidth:2,pointRadius:4,pointBackgroundColor:"#22C55E",tension:0.1,order:1,yAxisID:"y"},
+          {type:"line",label:"Actual",data:byMonth.map(d=>r2(d.actual)),borderColor:accent,backgroundColor:accent+"22",borderWidth:2,pointRadius:4,pointBackgroundColor:accent,tension:0.1,order:2,yAxisID:"y"},
+          {type:"bar",label:"Discounts",data:byMonth.map(d=>r2(d.discount)),backgroundColor:"#F59E0B66",borderColor:"#F59E0B",borderWidth:1,order:3,yAxisID:"y"},
+        ]
+      },
+      options:{
+        responsive:true,maintainAspectRatio:false,
+        plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": "+fmtUSD(ctx.parsed.y)}}},
+        scales:{
+          x:{ticks:{autoSkip:false,maxRotation:45},grid:{display:false}},
+          y:{ticks:{callback:v=>"$"+(v/1000).toFixed(0)+"K"},grid:{color:"rgba(128,128,128,0.12)"},min:0}
+        }
+      }
+    });
+
+    // Chart 2 — Per player (only if player data exists)
+    if(hasPlayerData && chartRef2.current){
+      const ppLabels = byMonth.filter((_,i)=>perPlayer[i]).map(d=>fmtYM(d.ym));
+      const ppData = perPlayer.filter(Boolean);
+      chartInst2.current = new Chart(chartRef2.current, {
+        type:"bar",
+        data:{
+          labels:ppLabels,
+          datasets:[
+            {label:"Gross/player",data:ppData.map(d=>d.grossPP),backgroundColor:"#22C55E99",borderColor:"#22C55E",borderWidth:1},
+            {label:"Actual/player",data:ppData.map(d=>d.actualPP),backgroundColor:accent+"99",borderColor:accent,borderWidth:1},
+            {label:"Discount/player",data:ppData.map(d=>d.discountPP),backgroundColor:"#F59E0B99",borderColor:"#F59E0B",borderWidth:1},
+          ]
+        },
+        options:{
+          responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>ctx.dataset.label+": $"+ctx.parsed.y.toFixed(2)}}},
+          scales:{
+            x:{ticks:{autoSkip:false,maxRotation:45},grid:{display:false}},
+            y:{ticks:{callback:v=>"$"+v.toFixed(2)},grid:{color:"rgba(128,128,128,0.12)"},min:0}
+          }
+        }
+      });
+    }
+
+    return ()=>destroyCharts();
+  },[byMonth, players, accent]);
+
+  const inp={padding:"6px 10px",borderRadius:6,border:`1px solid ${BORDER}`,background:DARK,color:TEXT,fontSize:11,width:"110px",outline:"none",fontFamily:"'DM Mono',monospace"};
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:20}}>
+
+      {/* Chart 1 */}
+      <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+        <SecHead accent={accent}>Gross vs Actual vs Discounts by Month</SecHead>
+        <div style={{display:"flex",gap:14,marginBottom:12,flexWrap:"wrap"}}>
+          <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:MUTED}}><div style={{width:20,borderTop:"2px dashed #22C55E"}}/><span style={{color:"#22C55E"}}>Gross</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:MUTED}}><div style={{width:20,borderTop:"2px solid "+accent}}/><span style={{color:accent}}>Actual</span></div>
+          <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:MUTED}}><div style={{width:12,height:12,borderRadius:2,background:"#F59E0B"}}/><span style={{color:"#F59E0B"}}>Discounts</span></div>
+        </div>
+        <div style={{position:"relative",width:"100%",height:280}}>
+          <canvas ref={chartRef1}/>
+        </div>
+        {byMonth.length>0&&(
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:12}}>
+            {byMonth.map(d=>(
+              <div key={d.ym} style={{fontSize:9,color:MUTED,background:DARK,borderRadius:4,padding:"3px 7px"}}>
+                {fmtYM(d.ym)}: <span style={{color:"#22C55E"}}>{fmtUSD(d.gross)}</span> → <span style={{color:accent}}>{fmtUSD(d.actual)}</span> <span style={{color:"#F59E0B"}}>(-{fmtUSD(d.discount)})</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Chart 2 — Per Player */}
+      <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+        <SecHead accent={accent}>Revenue Per Player by Month</SecHead>
+        <div style={{fontSize:11,color:MUTED,marginBottom:12}}>Enter player counts per month to see per-player metrics</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:16}}>
+          {byMonth.map(d=>(
+            <div key={d.ym} style={{display:"flex",flexDirection:"column",gap:4}}>
+              <label style={{fontSize:9,color:MUTED,letterSpacing:1}}>{fmtYM(d.ym)}</label>
+              <input type="number" placeholder="Players" value={players[d.ym]||""} style={inp}
+                onChange={e=>setPlayers(p=>({...p,[d.ym]:e.target.value}))}/>
+            </div>
+          ))}
+        </div>
+        {hasPlayerData?(
+          <>
+            <div style={{display:"flex",gap:14,marginBottom:12,flexWrap:"wrap"}}>
+              <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11}}><div style={{width:12,height:12,borderRadius:2,background:"#22C55E"}}/><span style={{color:"#22C55E"}}>Gross/player</span></div>
+              <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11}}><div style={{width:12,height:12,borderRadius:2,background:accent}}/><span style={{color:accent}}>Actual/player</span></div>
+              <div style={{display:"flex",alignItems:"center",gap:5,fontSize:11}}><div style={{width:12,height:12,borderRadius:2,background:"#F59E0B"}}/><span style={{color:"#F59E0B"}}>Discount/player</span></div>
+            </div>
+            <div style={{position:"relative",width:"100%",height:260}}>
+              <canvas ref={chartRef2}/>
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:12}}>
+              {byMonth.filter((_,i)=>perPlayer[i]).map((d,i)=>{
+                const pp=perPlayer.find(p=>p&&p.ym===d.ym);
+                if(!pp)return null;
+                return(
+                  <div key={d.ym} style={{fontSize:9,color:MUTED,background:DARK,borderRadius:4,padding:"3px 7px"}}>
+                    {fmtYM(d.ym)}: gross <span style={{color:"#22C55E"}}>${pp.grossPP.toFixed(2)}</span> · actual <span style={{color:accent}}>${pp.actualPP.toFixed(2)}</span> · disc <span style={{color:"#F59E0B"}}>${pp.discountPP.toFixed(2)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        ):(
+          <div style={{color:MUTED,fontSize:11,padding:"20px 0",textAlign:"center"}}>Enter player counts above to see per-player breakdown</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Brand view ────────────────────────────────────────────────────────────────
+function BrandView({rows,brand}){
+  const accent=brand==="gbgs"?GBGS:TEG;
+  const [filters,setFilters]=useState({year:"All",store:"",reason:""});
+  const [tab,setTab]=useState("overview");
+
+  const stores=useMemo(()=>[...new Set(rows.map(r=>r.store))].sort(),[rows]);
+  const reasons=useMemo(()=>[...new Set(rows.filter(r=>r.discount>0).map(r=>r.reason))].sort(),[rows]);
+
+  const filtered=useMemo(()=>rows.filter(r=>{
+    if(filters.year!=="All"&&r.date&&!r.date.startsWith(filters.year))return false;
+    if(filters.store&&r.store!==filters.store)return false;
+    if(filters.reason&&r.reason!==filters.reason)return false;
+    return true;
+  }),[rows,filters]);
+
+  const totalTxns=filtered.length;
+  const discTxns=useMemo(()=>filtered.filter(r=>r.discount>0).length,[filtered]);
+  const totalDisc=useMemo(()=>r2(filtered.reduce((s,r)=>s+r.discount,0)),[filtered]);
+  const totalGross=useMemo(()=>r2(filtered.reduce((s,r)=>s+r.total,0)),[filtered]);
+  const totalActual=useMemo(()=>r2(filtered.reduce((s,r)=>s+r.finalAmt,0)),[filtered]);
+  const discRate=totalGross>0?((totalDisc/totalGross)*100).toFixed(1):"0.0";
+  const avgDisc=discTxns>0?r2(totalDisc/discTxns):0;
+
+  const byStore=useMemo(()=>{
+    const m={};
+    for(const r of filtered){
+      if(!m[r.store])m[r.store]={store:r.store,gross:0,actual:0,discount:0,count:0,dCount:0};
+      m[r.store].gross+=r.total;m[r.store].actual+=r.finalAmt;
+      m[r.store].discount+=r.discount;m[r.store].count++;
+      if(r.discount>0)m[r.store].dCount++;
+    }
+    return Object.values(m).sort((a,b)=>b.gross-a.gross);
+  },[filtered]);
+
+  const byReason=useMemo(()=>{
+    const m={};
+    for(const r of filtered){
+      if(r.discount<=0||!r.reason)continue;
+      if(!m[r.reason])m[r.reason]={reason:r.reason,discount:0,count:0};
+      m[r.reason].discount+=r.discount;m[r.reason].count++;
+    }
+    return Object.values(m).sort((a,b)=>b.discount-a.discount);
+  },[filtered]);
+
+  const byProduct=useMemo(()=>{
+    const m={};
+    for(const r of filtered){
+      if(!m[r.product])m[r.product]={product:r.product,gross:0,actual:0,discount:0,count:0,qty:0};
+      m[r.product].gross+=r.total;m[r.product].actual+=r.finalAmt;
+      m[r.product].discount+=r.discount;m[r.product].count++;m[r.product].qty+=r.qty;
+    }
+    return Object.values(m).sort((a,b)=>b.gross-a.gross);
+  },[filtered]);
+
+  const byMonth=useMemo(()=>{
+    const m={};
+    for(const r of filtered){
+      if(!m[r.ym])m[r.ym]={ym:r.ym,gross:0,actual:0,value:0,count:0};
+      m[r.ym].gross+=r.total;m[r.ym].actual+=r.finalAmt;
+      m[r.ym].value+=r.discount;m[r.ym].count++;
+    }
+    return Object.entries(m).sort((a,b)=>a[0]>b[0]?1:-1).map(([ym,v])=>({...v,ym}));
+  },[filtered]);
+
+  const TABS=[
+    {id:"overview",label:"Overview"},
+    {id:"stores",label:"By Store"},
+    {id:"reasons",label:"By Discount Type"},
+    {id:"products",label:"By Product"},
+    {id:"trends",label:"Trends & Players"},
+    {id:"table",label:"Raw Data"},
+  ];
+
+  const thStyle={padding:"8px 10px",textAlign:"left",color:MUTED,fontWeight:"normal",fontSize:9,letterSpacing:1,textTransform:"uppercase",whiteSpace:"nowrap"};
+  const tdStyle={padding:"7px 10px",fontSize:10};
+
+  return(
+    <div>
+      {/* Filters */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:8,marginBottom:18}}>
+        {["All","2025","2026"].map(y=>(
+          <button key={y} onClick={()=>setFilters(f=>({...f,year:y}))}
+            style={{padding:"5px 14px",borderRadius:20,border:`1px solid ${filters.year===y?accent:BORDER}`,background:filters.year===y?`${accent}22`:"transparent",color:filters.year===y?accent:MUTED,fontSize:11,cursor:"pointer"}}>
+            {y}
+          </button>
+        ))}
+        <select value={filters.store} onChange={e=>setFilters(f=>({...f,store:e.target.value}))}
+          style={{padding:"5px 12px",borderRadius:20,border:`1px solid ${BORDER}`,background:DARK,color:TEXT,fontSize:11,cursor:"pointer",outline:"none"}}>
+          <option value="">All Stores</option>
+          {stores.map(s=><option key={s} value={s}>{s}</option>)}
+        </select>
+        <select value={filters.reason} onChange={e=>setFilters(f=>({...f,reason:e.target.value}))}
+          style={{padding:"5px 12px",borderRadius:20,border:`1px solid ${BORDER}`,background:DARK,color:TEXT,fontSize:11,cursor:"pointer",outline:"none"}}>
+          <option value="">All Discount Types</option>
+          {reasons.map(r=><option key={r} value={r}>{r}</option>)}
+        </select>
+      </div>
+
+      {/* KPIs */}
+      <div style={{display:"flex",flexWrap:"wrap",gap:10,marginBottom:18}}>
+        <KPI label="Gross Revenue" value={fmtUSD(totalGross)} sub={`${totalTxns.toLocaleString()} transactions`} accent={GREEN}/>
+        <KPI label="Actual Revenue" value={fmtUSD(totalActual)} sub="after all discounts" accent={accent}/>
+        <KPI label="Total Discounted" value={fmtUSD(totalDisc)} sub={`${discTxns.toLocaleString()} discounted txns`} accent={TEG}/>
+        <KPI label="Discount Rate" value={`${discRate}%`} sub={`avg ${fmtUSD(avgDisc)} per disc txn`} accent={GOLD}/>
+        <KPI label="Total Stores" value={byStore.length.toLocaleString()} sub="locations with transactions" accent={BLUE}/>
+        <KPI label="Avg Gross / Store" value={fmtUSD(byStore.length>0?r2(totalGross/byStore.length):0)} sub="average per location" accent={GREEN}/>
+        <KPI label="Avg Actual / Store" value={fmtUSD(byStore.length>0?r2(totalActual/byStore.length):0)} sub="after discounts" accent={accent}/>
+      </div>
+
+      {/* Sub-tabs */}
+      <div style={{display:"flex",gap:4,marginBottom:18,flexWrap:"wrap"}}>
+        {TABS.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)}
+            style={{padding:"6px 14px",borderRadius:6,border:`1px solid ${tab===t.id?accent:BORDER}`,background:tab===t.id?`${accent}18`:"transparent",color:tab===t.id?accent:MUTED,fontSize:11,cursor:"pointer"}}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Overview */}
+      {tab==="overview"&&(
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(340px,1fr))",gap:14}}>
+          <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+            <SecHead accent={accent}>Gross vs Actual by Month</SecHead>
+            <DualLine data={byMonth} accent={accent}/>
+            <div style={{display:"flex",flexWrap:"wrap",gap:6,marginTop:10}}>
+              {byMonth.map(d=>(
+                <div key={d.ym} style={{fontSize:9,color:MUTED,background:DARK,borderRadius:4,padding:"3px 7px"}}>
+                  {fmtYM(d.ym)}: <span style={{color:GREEN}}>{fmtUSD(d.gross)}</span> → <span style={{color:accent}}>{fmtUSD(d.actual)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+            <SecHead accent={accent}>Top Discount Types</SecHead>
+            <Bars data={byReason} vKey="discount" lKey="reason" accent={accent} maxBars={8} fmt={fmtUSD}/>
+          </div>
+          <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+            <SecHead accent={accent}>Top Stores by Gross Revenue</SecHead>
+            <Bars data={byStore} vKey="gross" lKey="store" accent={accent} maxBars={10} fmt={fmtUSD}/>
+          </div>
+          <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+            <SecHead accent={accent}>Most Discounted Products</SecHead>
+            <Bars data={byProduct.slice().sort((a,b)=>b.discount-a.discount)} vKey="discount" lKey="product" accent={accent} maxBars={10} fmt={fmtUSD}/>
+          </div>
+        </div>
+      )}
+
+      {/* By Store */}
+      {tab==="stores"&&(
+        <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18,overflowX:"auto"}}>
+          <SecHead accent={accent}>Discount by Store</SecHead>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr style={{borderBottom:`1px solid ${BORDER}`}}>
+              {["Store","Transactions","Disc Txns","Gross Revenue","Actual Revenue","Total Discounted","Disc Rate"].map(h=>(
+                <th key={h} style={thStyle}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {byStore.map((r,i)=>(
+                <tr key={r.store} style={{borderBottom:`1px solid ${BORDER}22`,background:i%2===0?"transparent":DARK}}>
+                  <td style={{...tdStyle,color:TEXT}}>{r.store}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{r.count.toLocaleString()}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{r.dCount.toLocaleString()}</td>
+                  <td style={{...tdStyle,color:GREEN}}>{fmtUSD(r.gross)}</td>
+                  <td style={{...tdStyle,color:accent}}>{fmtUSD(r.actual)}</td>
+                  <td style={{...tdStyle,color:TEG}}>{fmtUSD(r.discount)}</td>
+                  <td style={{...tdStyle,color:GOLD}}>{r.gross>0?((r.discount/r.gross)*100).toFixed(1):0}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* By Reason */}
+      {tab==="reasons"&&(
+        <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18,overflowX:"auto"}}>
+          <SecHead accent={accent}>Discount Types Breakdown</SecHead>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr style={{borderBottom:`1px solid ${BORDER}`}}>
+              {["Discount Reason","Usage Count","Total Discounted","Avg per Use","% of Gross Rev"].map(h=>(
+                <th key={h} style={thStyle}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {byReason.map((r,i)=>(
+                <tr key={r.reason} style={{borderBottom:`1px solid ${BORDER}22`,background:i%2===0?"transparent":DARK}}>
+                  <td style={{...tdStyle,color:TEXT}}>{r.reason}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{r.count.toLocaleString()}</td>
+                  <td style={{...tdStyle,color:accent}}>{fmtUSD(r.discount)}</td>
+                  <td style={{...tdStyle,color:GOLD}}>{fmtUSD(r.discount/r.count)}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{totalGross>0?((r.discount/totalGross)*100).toFixed(1):0}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* By Product */}
+      {tab==="products"&&(
+        <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18,overflowX:"auto"}}>
+          <SecHead accent={accent}>Product Revenue Breakdown</SecHead>
+          <table style={{width:"100%",borderCollapse:"collapse"}}>
+            <thead><tr style={{borderBottom:`1px solid ${BORDER}`}}>
+              {["Product","Qty","Transactions","Gross Revenue","Actual Revenue","Total Discounted","Disc Rate"].map(h=>(
+                <th key={h} style={thStyle}>{h}</th>
+              ))}
+            </tr></thead>
+            <tbody>
+              {byProduct.map((r,i)=>(
+                <tr key={r.product} style={{borderBottom:`1px solid ${BORDER}22`,background:i%2===0?"transparent":DARK}}>
+                  <td style={{...tdStyle,color:TEXT,maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.product}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{r.qty.toLocaleString()}</td>
+                  <td style={{...tdStyle,color:MUTED}}>{r.count.toLocaleString()}</td>
+                  <td style={{...tdStyle,color:GREEN}}>{fmtUSD(r.gross)}</td>
+                  <td style={{...tdStyle,color:accent}}>{fmtUSD(r.actual)}</td>
+                  <td style={{...tdStyle,color:TEG}}>{fmtUSD(r.discount)}</td>
+                  <td style={{...tdStyle,color:GOLD}}>{r.gross>0?((r.discount/r.gross)*100).toFixed(1):0}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Trends & Players */}
+      {tab==="trends"&&(
+        <TrendsView rows={filtered} brand={brand} accent={accent}/>
+      )}
+
+      {/* Raw Table */}
+      {tab==="table"&&(
+        <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:10,padding:18}}>
+          <SecHead accent={accent}>Raw Data ({filtered.length.toLocaleString()} rows)</SecHead>
+          <div style={{overflowX:"auto",maxHeight:500,overflowY:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead style={{position:"sticky",top:0,background:CARD}}>
+                <tr style={{borderBottom:`1px solid ${BORDER}`}}>
+                  {["Date","Store","Product","Qty","Gross","Discount","Reason","Actual"].map(h=>(
+                    <th key={h} style={thStyle}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.slice(0,500).map((r,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${BORDER}18`,background:i%2===0?"transparent":DARK}}>
+                    <td style={{...tdStyle,color:MUTED,whiteSpace:"nowrap"}}>{r.date}</td>
+                    <td style={{...tdStyle,color:TEXT,whiteSpace:"nowrap"}}>{r.store}</td>
+                    <td style={{...tdStyle,color:TEXT,maxWidth:180,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r.product}</td>
+                    <td style={{...tdStyle,color:MUTED}}>{r.qty}</td>
+                    <td style={{...tdStyle,color:GREEN}}>{fmtUSD(r.total)}</td>
+                    <td style={{...tdStyle,color:TEG}}>{r.discount>0?fmtUSD(r.discount):"—"}</td>
+                    <td style={{...tdStyle,color:GOLD,whiteSpace:"nowrap",maxWidth:140,overflow:"hidden",textOverflow:"ellipsis"}}>{r.discount>0?r.reason:"—"}</td>
+                    <td style={{...tdStyle,color:accent}}>{fmtUSD(r.finalAmt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {filtered.length>500&&<div style={{color:MUTED,fontSize:10,padding:"8px 10px"}}>Showing first 500 of {filtered.length.toLocaleString()} rows</div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Upload Modal ──────────────────────────────────────────────────────────────
+function UploadModal({onClose,onUpload,status}){
+  const [files,setFiles]=useState([]);
+  const [drag,setDrag]=useState(false);
+  const ref=useRef();
+
+  function readFiles(fileList){
+    Array.from(fileList).forEach(f=>{
+      const reader=new FileReader();
+      reader.onload=e=>{
+        const rows=processCSV(e.target.result);
+        const teg=rows.filter(r=>r.brand==="teg");
+        const gbgs=rows.filter(r=>r.brand==="gbgs");
+        setFiles(p=>[...p,{name:f.name,tegRows:teg,gbgsRows:gbgs}]);
+      };
+      reader.readAsText(f);
+    });
+  }
+
+  const totalTeg=files.reduce((s,f)=>s+f.tegRows.length,0);
+  const totalGbgs=files.reduce((s,f)=>s+f.gbgsRows.length,0);
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,padding:16}}>
+      <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:12,padding:32,maxWidth:500,width:"100%",maxHeight:"90vh",overflowY:"auto"}}>
+        <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:24,color:"#fff",marginBottom:4}}>ADD DATA</div>
+        <div style={{color:MUTED,fontSize:11,marginBottom:16}}>New uploads add to existing data — nothing is overwritten</div>
+        <div onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)}
+          onDrop={e=>{e.preventDefault();setDrag(false);readFiles(e.dataTransfer.files);}}
+          onClick={()=>ref.current.click()}
+          style={{border:`2px dashed ${drag?TEG:BORDER}`,borderRadius:10,padding:"22px 20px",cursor:"pointer",textAlign:"center",marginBottom:12,background:drag?`${TEG}08`:"transparent"}}>
+          <div style={{fontSize:22,marginBottom:6}}>📂</div>
+          <div style={{color:"#888",fontSize:12}}>Drop CSV files here or click to browse</div>
+        </div>
+        <input ref={ref} type="file" accept=".csv" multiple style={{display:"none"}} onChange={e=>readFiles(e.target.files)}/>
+        {files.map(f=>(
+          <div key={f.name} style={{padding:"9px 12px",background:DARK,borderRadius:8,marginBottom:6,border:`1px solid ${BORDER}`}}>
+            <div style={{color:"#ccc",fontSize:11}}>{f.name}</div>
+            <div style={{fontSize:9,color:MUTED,marginTop:2}}>
+              <span style={{color:TEG}}>{f.tegRows.length} TEG</span> · <span style={{color:GBGS}}>{f.gbgsRows.length} GBGS</span> rows
+            </div>
+          </div>
+        ))}
+        {totalTeg+totalGbgs>0&&(
+          <div style={{margin:"10px 0",padding:"9px 12px",background:DARK,borderRadius:8,border:`1px solid ${BORDER}`,fontSize:11,color:MUTED}}>
+            Ready: <span style={{color:TEG}}>{totalTeg} TEG</span> + <span style={{color:GBGS}}>{totalGbgs} GBGS</span> rows
+          </div>
+        )}
+        {status&&(
+          <div style={{textAlign:"center",padding:"16px 0 8px"}}>
+            <div className="spinner"/>
+            <div style={{color:GOLD,fontSize:11}}>{status}</div>
+          </div>
+        )}
+        {!status&&(
+          <div style={{display:"flex",gap:10,marginTop:18}}>
+            <button onClick={onClose} style={{flex:1,padding:"9px",borderRadius:8,border:`1px solid ${BORDER}`,background:"transparent",color:MUTED,cursor:"pointer",fontSize:12}}>Cancel</button>
+            <button disabled={!files.length} onClick={()=>onUpload(files)}
+              style={{flex:2,padding:"9px",borderRadius:8,border:"none",background:files.length?TEG:"#333",color:files.length?"#fff":MUTED,cursor:files.length?"pointer":"default",fontFamily:"'Bebas Neue',sans-serif",fontSize:16,letterSpacing:1}}>
+              UPLOAD TO SHEETS
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Setup Modal ───────────────────────────────────────────────────────────────
+function SetupModal({onSave}){
+  const [url,setUrl]=useState("");
+  const [pw,setPw]=useState("");
+  const [err,setErr]=useState("");
+  const [busy,setBusy]=useState(false);
+
+  async function connect(){
+    setBusy(true);setErr("");
+    try{
+      if(pw!==PASSWORD){setErr("Incorrect password");setBusy(false);return;}
+      const r=await gasGet(url,"ping");
+      if(r.ok){onSave(url);}
+      else setErr(r.error||"Connection failed");
+    }catch(e){setErr("Could not reach that URL — double check it");}
+    setBusy(false);
+  }
+
+  const inp={width:"100%",padding:"10px 12px",borderRadius:8,border:`1px solid ${BORDER}`,background:DARK,color:TEXT,fontSize:12,boxSizing:"border-box",marginBottom:14,outline:"none",fontFamily:"'DM Mono',monospace"};
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.97)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:200,padding:16}}>
+      <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:12,padding:36,maxWidth:460,width:"100%"}}>
+        <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:30,color:TEG,letterSpacing:2,marginBottom:2}}>TEG DISCOUNT DASHBOARD</div>
+        <div style={{color:MUTED,fontSize:11,marginBottom:26}}>Price Adjustments · Coupons · Promotions</div>
+        <label style={{fontSize:9,color:MUTED,letterSpacing:1,textTransform:"uppercase",display:"block",marginBottom:6}}>Google Apps Script URL</label>
+        <input value={url} onChange={e=>setUrl(e.target.value)} placeholder="https://script.google.com/macros/s/..." style={inp}/>
+        <label style={{fontSize:9,color:MUTED,letterSpacing:1,textTransform:"uppercase",display:"block",marginBottom:6}}>Password</label>
+        <input type="password" value={pw} onChange={e=>setPw(e.target.value)} placeholder="••••••••" style={inp}/>
+        {err&&<div style={{color:TEG,fontSize:11,marginBottom:10}}>{err}</div>}
+        <button onClick={connect} disabled={!url||!pw||busy}
+          style={{width:"100%",padding:"12px",borderRadius:8,border:"none",background:url&&pw?TEG:"#333",color:"#fff",cursor:url&&pw?"pointer":"default",fontFamily:"'Bebas Neue',sans-serif",fontSize:18,letterSpacing:2}}>
+          {busy?"CONNECTING...":"CONNECT"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  const [gasUrl,setGasUrl]=useState(()=>{try{return localStorage.getItem(GAS_KEY)||""}catch{return""}});
+  const [tegRows,setTegRows]=useState([]);
+  const [gbgsRows,setGbgsRows]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [err,setErr]=useState("");
+  const [showUpload,setShowUpload]=useState(false);
+  const [uploadStatus,setUploadStatus]=useState("");
+  const [brand,setBrand]=useState("teg");
+
+  async function load(){
+    if(!gasUrl)return;
+    setLoading(true);setErr("");
+    try{
+      const r=await gasGet(gasUrl,"load");
+      if(r.ok){setTegRows(r.data?.tegRows||[]);setGbgsRows(r.data?.gbgsRows||[]);}
+      else setErr(r.error||"Load failed");
+    }catch(e){setErr("Could not reach Google Sheets");}
+    setLoading(false);
+  }
+
+  useEffect(()=>{if(gasUrl)load();},[gasUrl]);
+
+  async function handleUpload(files){
+    const allTeg=files.flatMap(f=>f.tegRows);
+    const allGbgs=files.flatMap(f=>f.gbgsRows);
+    if(!allTeg.length&&!allGbgs.length)return;
+    setUploadStatus("Uploading…");
+    try{
+      if(allTeg.length)await gasPost(gasUrl,"append",{brand:"teg",rows:allTeg});
+      if(allGbgs.length)await gasPost(gasUrl,"append",{brand:"gbgs",rows:allGbgs});
+      setUploadStatus("Refreshing…");
+      await load();
+      setShowUpload(false);setUploadStatus("");
+    }catch(e){setUploadStatus("Upload failed — try again");setTimeout(()=>setUploadStatus(""),3000);}
+  }
+
+  function saveUrl(url){try{localStorage.setItem(GAS_KEY,url)}catch{}setGasUrl(url);}
+
+  if(!gasUrl)return<SetupModal onSave={saveUrl}/>;
+
+  const activeRows=brand==="gbgs"?gbgsRows:tegRows;
+  const accent=brand==="gbgs"?GBGS:TEG;
+
+  return(
+    <div style={{minHeight:"100vh",background:BG,color:TEXT,fontFamily:"'DM Mono',monospace",paddingBottom:60}}>
+      <div style={{borderBottom:`1px solid ${BORDER}`,padding:"14px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10,position:"sticky",top:0,background:BG,zIndex:10}}>
+        <div>
+          <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:26,color:accent,letterSpacing:3,lineHeight:1}}>TEG DISCOUNT ANALYTICS</div>
+          <div style={{fontSize:9,color:MUTED,letterSpacing:2,marginTop:1}}>PRICE ADJUSTMENTS · COUPONS · PROMOTIONS</div>
+        </div>
+        <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+          {[{id:"teg",label:`TEG (${tegRows.length.toLocaleString()})`,a:TEG},{id:"gbgs",label:`GBGS (${gbgsRows.length.toLocaleString()})`,a:GBGS}].map(b=>(
+            <button key={b.id} onClick={()=>setBrand(b.id)}
+              style={{padding:"5px 14px",borderRadius:6,border:`1px solid ${brand===b.id?b.a:BORDER}`,background:brand===b.id?`${b.a}18`:"transparent",color:brand===b.id?b.a:MUTED,fontSize:11,cursor:"pointer"}}>
+              {b.label}
+            </button>
+          ))}
+          <button onClick={()=>setShowUpload(true)} style={{padding:"5px 14px",borderRadius:6,border:`1px solid ${accent}`,background:`${accent}18`,color:accent,fontSize:11,cursor:"pointer"}}>+ Upload</button>
+          <button onClick={load} disabled={loading} style={{padding:"5px 12px",borderRadius:6,border:`1px solid ${BORDER}`,background:"transparent",color:loading?MUTED:TEXT,fontSize:12,cursor:"pointer",display:"flex",alignItems:"center",gap:5}}>
+            {loading?<span style={{display:"inline-block",width:12,height:12,border:"2px solid #2a2a3a",borderTopColor:accent,borderRadius:"50%",animation:"spin 0.7s linear infinite"}}/>:"↻"}
+          </button>
+          <button onClick={()=>{try{localStorage.removeItem(GAS_KEY)}catch{}setGasUrl("")}} style={{padding:"5px 10px",borderRadius:6,border:`1px solid ${BORDER}`,background:"transparent",color:MUTED,fontSize:11,cursor:"pointer"}}>⚙</button>
+        </div>
+      </div>
+      <div style={{padding:"20px 24px"}}>
+        {err&&<div style={{color:TEG,fontSize:11,marginBottom:14,padding:"9px 12px",background:DARK,borderRadius:8,border:`1px solid ${TEG}33`}}>{err}</div>}
+        {activeRows.length===0&&!loading?(
+          <div style={{textAlign:"center",padding:"70px 20px",color:MUTED}}>
+            <div style={{fontSize:36,marginBottom:14}}>🏷️</div>
+            <div style={{fontFamily:"'Bebas Neue',sans-serif",fontSize:22,color:accent,letterSpacing:2,marginBottom:8}}>No Data Yet</div>
+            <div style={{fontSize:12,marginBottom:18}}>Upload your merch CSVs to start analyzing discounts</div>
+            <button onClick={()=>setShowUpload(true)} style={{padding:"10px 26px",borderRadius:8,border:"none",background:accent,color:"#fff",cursor:"pointer",fontFamily:"'Bebas Neue',sans-serif",fontSize:16,letterSpacing:2}}>UPLOAD CSV</button>
+          </div>
+        ):(
+          <BrandView rows={activeRows} brand={brand}/>
+        )}
+      </div>
+      {showUpload&&<UploadModal onClose={()=>setShowUpload(false)} onUpload={handleUpload} status={uploadStatus}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
